@@ -1,26 +1,13 @@
 #!/usr/bin/env bash
 # 应用 SUSFS 补丁及各内核版本所需的上下文修复
+#
 # 依赖环境变量：
 #   ANDROID_VERSION KERNEL_VERSION KSU_VARIANT OS_PATCH_LEVEL SUB_LEVEL
 #   KERNEL_ROOT SUSFS4KSU KERNEL_PATCHES LEGACY_SUKISU_CONFIG
 # 调用前必须将工作目录设为 $KERNEL_ROOT
 set -eo pipefail
 
-# 列出当前目录下不属于上游的 .rej（相对路径，已排序）。
-# 上游分支可能自带已提交的 .rej（如 android15-6.6-2026-04 的 mm/rmap.c.rej，
-# 是上游解决合并冲突时的残留），那不是本补丁的冲突；但 patch 失败时会覆盖同名文件，
-# 所以只有「被 git 跟踪且未改动」的才视为上游自带。
-# 不在 git 仓库里（本地 verify_context.sh）时 git 命令为空，退回全部 .rej
-list_upstream_rej() {
-  git ls-files -- '*.rej' 2>/dev/null | while IFS= read -r f; do
-    git diff --quiet -- "$f" 2>/dev/null && echo "$f"
-  done
-}
-list_untracked_rej() {
-  comm -23 \
-    <(find . -type f -name '*.rej' | sed 's|^\./||' | sort) \
-    <(list_upstream_rej | sort)
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "应用 SUSFS 补丁..."
 
@@ -30,15 +17,11 @@ cp "$SUSFS4KSU"/kernel_patches/fs/* ./common/fs/
 cp "$SUSFS4KSU"/kernel_patches/include/linux/* ./common/include/linux/
 
 case "$KSU_VARIANT" in
-  "Official")
-    cd ./KernelSU
-    cp "$SUSFS4KSU"/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
-    patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
-
-    cd ..
+  "SukiSU"|"BakaSU")
+    echo "SukiSU/BakaSU 使用内置 SUSFS 支持"
     ;;
-  "Next"|"SukiSU"|"SukiSU(40726)"|"SukiSU(40548)"|"BakaSU")
-    echo "Next/SukiSU/SukiSU(40726)/SukiSU(40548)/BakaSU 使用内置 SUSFS 支持"
+  "FinaSU")
+    echo "FinaSU 使用 susfs4ksu 官方内核侧集成补丁（10_enable + drift-fixes 已在前置步骤应用）"
     ;;
 esac
 
@@ -90,11 +73,10 @@ if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
     fi
     adjust_legacy_fdinfo_context
   fi
-  if [[ "$OS_PATCH_LEVEL" == "lts" ]]; then
-    echo "临时调整 Android 13 5.15 LTS 头文件上下文"
-    sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
-    sed -i '/^#include <trace\/hooks\/mm.h>$/d' fs/proc/task_mmu.c
-  fi
+  # 5.15.220(LTS) 原生含 #include <trace/hooks/{mm,blk}.h>。上游 rebase 后
+  # 主补丁已把这两行当作 susfs_def.h 插入 hunk 的上下文，旧版「先删后补」的
+  # 临时调整反而会让 hunk 整段被拒，故不再删除；缺失上下文的版本由
+  # normalize_trace_ctx.py 归一化补丁副本处理。
 fi
 
 if [[ "$ANDROID_VERSION" == "android14" && "$KERNEL_VERSION" == "6.1" ]]; then
@@ -123,11 +105,70 @@ if [[ "$ANDROID_VERSION" == "android15" && "$KERNEL_VERSION" == "6.6" ]]; then
   fi
 fi
 
+# 6.12 主补丁的 fs/exec.c 首个 hunk 以 `#include <linux/dma-buf.h>`（紧跟 ksm.h）
+# 作为插入 susfs_def.h 的上下文锚点。GKI 6.12.58+ 的 exec.c 原生就是这个形态，
+# 补丁可直接匹配；6.12.23~38 没有这行 dma-buf.h，hunk 会被整段拒绝，exec.c 因此
+# 缺少 susfs_def.h，do_execveat_common() 里的 susfs_is_current_proc_no_su()
+# 变成隐式声明，clang -Werror 直接中断编译。
+# 仅当源码缺少该上下文时改写补丁副本：丢掉这行陈旧上下文并重算 hunk 行数；
+# 源码本身不做任何增删（原「先删 dma-buf.h、事后补到文件头」的错位调整已移除）。
+normalize_exec_include_hunk() {
+  python3 - "$SUSFS_PATCH" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+src = open("fs/exec.c", encoding="utf-8", errors="surrogateescape").read()
+if "#include <linux/ksm.h>\n#include <linux/dma-buf.h>" in src:
+    print("fs/exec.c 原生含 dma-buf.h 锚点，主补丁可直接匹配，跳过归一化")
+    raise SystemExit(0)
+
+with open(path, encoding="utf-8", errors="surrogateescape") as f:
+    lines = f.read().splitlines()
+
+hdr = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+out, i, dropped = [], 0, 0
+
+while i < len(lines):
+    line = lines[i]
+    m = hdr.match(line)
+    if not m:
+        out.append(line)
+        i += 1
+        continue
+
+    j = i + 1
+    body = []
+    while j < len(lines) and not lines[j].startswith(("@@", "diff --git")):
+        body.append(lines[j])
+        j += 1
+
+    # 只处理「插入 susfs_def.h 且以 dma-buf.h 为上下文」的那个 hunk
+    if any(l.strip() == "#include <linux/dma-buf.h>" for l in body) \
+            and any("susfs_def.h" in l for l in body):
+        kept = [l for l in body if l.strip() != "#include <linux/dma-buf.h>"]
+        dropped += len(body) - len(kept)
+        old = sum(1 for l in kept if l[:1] in (" ", "-"))
+        new = sum(1 for l in kept if l[:1] in (" ", "+"))
+        line = "@@ -%s,%d +%s,%d @@" % (m.group(1), old, m.group(3), new)
+        body = kept
+
+    out.append(line)
+    out.extend(body)
+    i = j
+
+if dropped:
+    with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write("\n".join(out) + "\n")
+    print("fs/exec.c 补丁上下文已归一化（移除 %d 行陈旧 dma-buf 上下文）" % dropped)
+else:
+    print("fs/exec.c 补丁上下文无需归一化")
+PYEOF
+}
+
 if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
-  if [[ "$CURRENT_SUB" -ge 58 ]]; then
-    echo "临时调整 Android 16 6.12 exec.c 上下文"
-    sed -i '/^#include <linux\/dma-buf.h>$/d' fs/exec.c
-  fi
+  echo "归一化 Android 16 6.12 主补丁的 fs/exec.c 头文件上下文"
+  normalize_exec_include_hunk
 fi
 
 # 新版内核在 super.c 的 internal.h 之后新增了 trace/hooks/fs.h，
@@ -142,11 +183,456 @@ if grep -q '^ static int thaw_super_locked' "$SUSFS_PATCH" \
   SUPER_FS_H_REMOVED=1
 fi
 
+# 上游 rebase 到 5.15.211 后，susfs_def.h 的插入 hunk 把 trace/hooks 头文件
+# 当成了上下文：5.15.74~194 源码没有这些行，hunk 会整段被拒，最终因
+# SUSFS_IS_INODE_* 隐式声明在 clang -Werror 处中断。按源码实际内容归一化补丁副本。
+echo "归一化 SUSFS 头文件上下文"
+python3 "$SCRIPT_DIR/normalize_trace_ctx.py" "$SUSFS_PATCH"
+
 patch -p1 < "$SUSFS_PATCH" || true
+
+# ==================== SukiSU builtin 新 selinux_hide 模型适配（services.c 跳板符号） ====================
+# SukiSU-Ultra builtin 2026-05-29 (5fb0c079) 同步 tiann/KernelSU 的 SELinux 新检测
+# 修复后，feature/selinux_hide.c 在 >=6.6 分支把 security_dump_masked_av_fn /
+# context_struct_compute_av_fn 声明为 extern 函数——上游预期由 services.c 补丁提供
+# 这两个跳板符号（builtin c32094a4 提交说明），但 SUSFS 主补丁只在 services.c 提供
+# my_security_compute_av_user，不含这两个符号，导致 6.6/6.12 全部 SUSFS 构建在
+# vmlinux 链接阶段报：
+#   ld.lld: error: undefined symbol: context_struct_compute_av_fn
+# 在 services.c 末尾补上两个跳板（对同名 static 函数的薄封装，与上游预期形态一致）；
+# 仅当检测到 builtin 的 extern 引用且 services.c 尚无跳板时追加，
+# 上游自行提供后按内容检测自动跳过，幂等。
+KSU_HIDE_FILE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
+SEC_SERVICES="security/selinux/ss/services.c"
+if [ -f "$KSU_HIDE_FILE" ] && grep -q 'extern void context_struct_compute_av_fn' "$KSU_HIDE_FILE" \
+  && [ -f "$SEC_SERVICES" ] && ! grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES"; then
+  if ! grep -q 'static void context_struct_compute_av(' "$SEC_SERVICES"; then
+    echo "::error::services.c 缺少 static context_struct_compute_av，无法生成 SukiSU 跳板符号"
+    exit 1
+  fi
+  echo "补齐 SukiSU builtin selinux_hide 所需的 services.c 跳板符号..."
+  python3 - "$SEC_SERVICES" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8", errors="surrogateescape").read()
+if "void context_struct_compute_av_fn(" in src:
+    sys.exit(0)
+tramp = (
+    "\n"
+    "/* Trampolines for SukiSU-Ultra builtin selinux_hide (KSU_SUSFS builds):\n"
+    " * kernel/feature/selinux_hide.c (>=6.6 model) declares *_fn as extern;\n"
+    " * provide thin wrappers around the static implementations here. */\n"
+    "#ifdef CONFIG_KSU_SUSFS\n"
+    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
+    "\t\t\t\t  struct context *scontext,\n"
+    "\t\t\t\t  struct context *tcontext,\n"
+    "\t\t\t\t  u16 tclass,\n"
+    "\t\t\t\t  struct av_decision *avd,\n"
+    "\t\t\t\t  struct extended_perms *xperms);\n"
+    "void context_struct_compute_av_fn(struct policydb *policydb,\n"
+    "\t\t\t\t  struct context *scontext,\n"
+    "\t\t\t\t  struct context *tcontext,\n"
+    "\t\t\t\t  u16 tclass,\n"
+    "\t\t\t\t  struct av_decision *avd,\n"
+    "\t\t\t\t  struct extended_perms *xperms)\n"
+    "{\n"
+    "\tcontext_struct_compute_av(policydb, scontext, tcontext, tclass, avd, xperms);\n"
+    "}\n"
+)
+if "static void security_dump_masked_av(" in src:
+    tramp += (
+        "\n"
+        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
+        "\t\t\t\tstruct context *scontext,\n"
+        "\t\t\t\tstruct context *tcontext,\n"
+        "\t\t\t\tu16 tclass,\n"
+        "\t\t\t\tu32 permissions,\n"
+        "\t\t\t\tconst char *reason);\n"
+        "void security_dump_masked_av_fn(struct policydb *policydb,\n"
+        "\t\t\t\tstruct context *scontext,\n"
+        "\t\t\t\tstruct context *tcontext,\n"
+        "\t\t\t\tu16 tclass,\n"
+        "\t\t\t\tu32 permissions,\n"
+        "\t\t\t\tconst char *reason)\n"
+        "{\n"
+        "\tsecurity_dump_masked_av(policydb, scontext, tcontext, tclass, permissions, reason);\n"
+        "}\n"
+    )
+else:
+    print("::warning::services.c 缺少 static security_dump_masked_av，跳过对应跳板")
+tramp += "#endif /* CONFIG_KSU_SUSFS */\n"
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(src + tramp)
+print("%s: appended *_fn trampolines" % path)
+PYEOF
+  grep -q 'void context_struct_compute_av_fn(' "$SEC_SERVICES" \
+    || { echo "::error::services.c 跳板符号追加后校验失败"; exit 1; }
+  echo "services.c: 已提供 context_struct_compute_av_fn / security_dump_masked_av_fn"
+fi
+
+# ==================== KernelSU 缺失的 SUSFS 内联钩子符号（6.6+/6.12 主补丁形态）====================
+# 6.6/6.12 主补丁在 security/selinux/{hooks,selinuxfs}.c 内联改写调用点，要求 KernelSU 侧
+# 以全局符号提供 my_setprocattr / my_write_context / my_write_access；并在 fs/exec.c 调用
+# ksu_setup_preinit_file / ksu_preinit_handle_post_execveat（受 KSU_NO_PREINIT 开关控制）。
+# SukiSU-Ultra（builtin 5ef32ad / main 31255c4）两者都不提供，KPM+SUSFS 的 6.12 构建在
+# vmlinux 链接阶段报：
+#   ld.lld: error: undefined symbol: my_setprocattr / my_write_context / my_write_access
+#   ld.lld: error: undefined symbol: ksu_setup_preinit_file / ksu_preinit_handle_post_execveat
+# 处理：按 KernelSU 实际能力裁剪（SELinux 包装函数回落到内核原生处理函数、preinit 走主补丁
+# 自带开关），保留 SUSFS 其余功能；KernelSU 上游补齐后脚本按内容检测自动跳过，幂等。
+echo "按 KernelSU 实际能力裁剪 SUSFS 内联钩子..."
+python3 "$SCRIPT_DIR/ksu_susfs_hooks.py" "$KERNEL_ROOT" \
+  || { echo "::error::SUSFS 内联钩子裁剪失败"; exit 1; }
+
+# ==================== FinaSU 新 selinux_hide 模型适配 ====================
+# 自 FinaSU v0.1.0-preview1 起，kernel/feature/selinux_hide.c 换成了 tiann 新形态：
+#   移除 fake_state；统一用 backup_sepolicy + security_context_to_sid_with_policy(..., &orig_sid_p, &orig_rc_p)（8 参）；
+#   且该函数内部已做“双策略 + 全局 sidtab 同步”（KernelSU #3877/#3873）。
+# 此形态下把 SUSFS 主补丁 <6.6 的 SELinux 代码也从 &fake_state 切到 backup_sepolicy + 8 参 _with_policy，
+# 并补上权限检查顺序（df03912f）；sidtab 同步由上游 _with_policy 内置，无需外部再移植。
+NEW_MODEL=0
+FINASU_SELINUX_HIDE="$KERNEL_ROOT/KernelSU/kernel/feature/selinux_hide.c"
+if [ -f "$FINASU_SELINUX_HIDE" ] && ! grep -q 'fake_state' "$FINASU_SELINUX_HIDE"; then
+  NEW_MODEL=1
+fi
+# 触发条件：
+#   <6.6（5.10/5.15/6.1）主补丁内联改 selinuxfs 调用点 / selinux_setprocattr，引用 &fake_state；
+#   >=6.6（6.6/6.12）主补丁用 backup_sepolicy + 内核侧自含的 my_security_context_to_sid，
+#   不引用 fake_state，无需本分支（条件里两个 grep 均不命中，自动跳过）。
+# <6.6 必须从 fake_state 切到 backup_sepolicy + 8 参 _with_policy，否则新形态 FinaSU 无
+# fake_state 定义会导致 ThinLTO 链接报 undefined symbol: fake_state。
+if [ "$NEW_MODEL" = 1 ] && [ -f security/selinux/selinuxfs.c ] \
+  && { grep -q 'static ssize_t my_write_context' security/selinux/selinuxfs.c \
+       || grep -q '&fake_state' security/selinux/selinuxfs.c; }; then
+  echo "检测到 FinaSU 新 selinux_hide 形态：SUSFS <6.6 的 SELinux 代码切换到 backup_sepolicy + 8 参 _with_policy"
+  python3 - <<'PYEOF'
+import re as _re, sys as _sys
+
+NEW_FS_EXTERNS = (
+    "extern struct selinux_policy *backup_sepolicy;\n"
+    "extern int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);\n"
+    "extern int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext, u32 *scontext_len);\n"
+    "extern void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);\n"
+)
+NEW_HK_EXTERNS = (
+    "extern struct selinux_policy *backup_sepolicy;\n"
+    "extern int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len, u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);\n"
+)
+
+def _sub(path, name, old, new):
+    s = open(path, encoding="utf-8", errors="surrogateescape").read()
+    n = s.count(old)
+    if n != 1:
+        print("::warning::%s: %s count=%d (expect 1)" % (path, name, n))
+        return
+    open(path, "w", encoding="utf-8", errors="surrogateescape").write(s.replace(old, new, 1))
+    print("%s: %s OK" % (path, name))
+
+fs = "security/selinux/selinuxfs.c"
+_sub(fs, "extern", "extern struct selinux_state fake_state;\n", NEW_FS_EXTERNS)
+_sub(fs, "ctx", "security_context_to_sid(&fake_state, buf, size, &sid, GFP_KERNEL)",
+     "security_context_to_sid_with_policy(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)")
+_sub(fs, "sid2ctx", "security_sid_to_context(&fake_state, sid, &canon, &len)",
+     "security_sid_to_context_with_policy(backup_sepolicy, sid, &canon, &len)")
+_sub(fs, "scon", "security_context_str_to_sid(&fake_state, scon, &ssid, GFP_KERNEL)",
+     "security_context_to_sid_with_policy(backup_sepolicy, scon, strlen(scon), &ssid, SECSID_NULL, GFP_KERNEL, NULL, NULL)")
+_sub(fs, "tcon", "security_context_str_to_sid(&fake_state, tcon, &tsid, GFP_KERNEL)",
+     "security_context_to_sid_with_policy(backup_sepolicy, tcon, strlen(tcon), &tsid, SECSID_NULL, GFP_KERNEL, NULL, NULL)")
+_sub(fs, "av", "security_compute_av_user(&fake_state, ssid, tsid, tclass, &avd)",
+     "security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid, tclass, &avd)")
+
+hk = "security/selinux/hooks.c"
+_sub(hk, "extern", "extern struct selinux_state fake_state;\n", NEW_HK_EXTERNS)
+
+# <6.6 形态：resolve(&fake_state, value) -> _with_policy(8 参)
+#   6.1 主补丁为多行 &sid；5.15 主补丁为单行 &tmp_sid。两种都归一化。
+_hs = open(hk, encoding="utf-8", errors="surrogateescape").read()
+_hs, _n = _re.subn(r"security_context_to_sid\(&fake_state, value, size,\s*\n\s*&sid, GFP_KERNEL\)",
+                   "security_context_to_sid_with_policy(backup_sepolicy, value, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)", _hs)
+_hs, _n15 = _re.subn(r"security_context_to_sid\(&fake_state, value, size, &tmp_sid, GFP_KERNEL\)",
+                     "security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)", _hs)
+print("%s: setprocattr.ctx <6.6=%d/%d" % (hk, _n, _n15))
+open(hk, "w", encoding="utf-8", errors="surrogateescape").write(_hs)
+
+# >=6.6 形态：把已有的 6 参 _with_policy 声明/调用补成 8 参（新模型签名）
+#   6.6 主补丁在 security/selinux/{hooks,selinuxfs}.c 里自带 6 参 extern 声明，
+#   只把调用补成 8 参会报 "too many arguments to function call, expected 6, have 8"。
+#   因此 extern 声明必须与调用一起改成 8 参（新 FinaSU 的定义是 8 参）。
+for _lab, _f in (("selinuxfs", fs), ("hooks", hk)):
+    _s = open(_f, encoding="utf-8", errors="surrogateescape").read()
+    # (?!, NULL, NULL) 保证幂等：<6.6 已由上文 _sub 切成 8 参的调用不再重复追加
+    _s, _n2 = _re.subn(r"(security_context_to_sid_with_policy\(backup_sepolicy,[^;]*?, GFP_KERNEL)\)(?!, NULL, NULL)", r"\1, NULL, NULL)", _s)
+    _s, _nd = _re.subn(r"(security_context_to_sid_with_policy\(struct selinux_policy \*policy, const char \*scontext, u32 scontext_len,\s*\n\s*u32 \*sid, u32 def_sid, gfp_t gfp_flags)\);", r"\1, u32 *orig_sid_p, int *orig_rc_p);", _s)
+    open(_f, "w", encoding="utf-8", errors="surrogateescape").write(_s)
+    print("%s: _with_policy 8-arg normalize=%d decl=%d" % (_lab, _n2, _nd))
+
+_hs = open(hk, encoding="utf-8", errors="surrogateescape").read()
+# 主补丁 setprocattr 两种形态：
+#   旧形态（~2026-08 前的主补丁）：定义 my_setprocattr，内含无条件 SETCURRENT avc_has_perm
+#     —— 需要 rm_early 移除 + seq 重排（df03912f）；
+#   现行形态（2026-10 起的主补丁）：内联改 selinux_setprocattr，用 should_check_current +
+#     fake_error 门控 —— 权限顺序天然满足 df03912f，且 fake 解析经上文 setprocattr.ctx
+#     转换后已走 8 参 _with_policy（sidtab 同步内置），rm_early/seq 无目标代码。
+if "should_check_current" in _hs and "fake_error = security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL, GFP_KERNEL, NULL, NULL)" in _hs:
+    print("%s: 主补丁为现行门控形态（should_check_current+fake_error），rm_early_setcurrent/seq 不适用，侧信道语义已覆盖" % hk)
+else:
+    # 去掉无条件 SETCURRENT 检查（df03912f）：覆盖 <6.6(&selinux_state) 与 >=6.6(无 state) 两种形态
+    _removed = False
+    for _rm in ("\terror = avc_has_perm(&selinux_state,\n\t\t\t\t     mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL);\n\n\tif (error)\n\t\treturn error;\n\n",
+                "\terror = avc_has_perm(mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL);\n\n\tif (error)\n\t\treturn error;\n\n"):
+        if _hs.count(_rm) == 1:
+            _hs = _hs.replace(_rm, "", 1)
+            _removed = True
+            print("%s: rm_early_setcurrent OK" % hk)
+            break
+    if not _removed:
+        print("::warning::%s: rm_early_setcurrent not matched" % hk)
+    # 仅在 backup 解析失败时才检查 SETCURRENT
+    _seq_done = False
+    for _old2, _new2, _lab in (
+        ("\t\terror = security_context_to_sid_with_policy(backup_sepolicy, value, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error)\n\t\t\treturn error;\n",
+         "\t\terror = security_context_to_sid_with_policy(backup_sepolicy, value, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error) {\n\t\t\tint perm_error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n", "<6.6"),
+        ("\t\terror = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error)\n\t\t\treturn error;\n",
+         "\t\terror = security_context_to_sid_with_policy(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL, NULL, NULL);\n\t\tif (error) {\n\t\t\tint perm_error = avc_has_perm(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n", ">=6.6")):
+        if _hs.count(_old2) == 1:
+            _hs = _hs.replace(_old2, _new2, 1)
+            _seq_done = True
+            print("%s: seq(%s) OK" % (hk, _lab))
+            break
+    if not _seq_done:
+        print("::warning::%s: seq not matched" % hk)
+open(hk, "w", encoding="utf-8", errors="surrogateescape").write(_hs)
+for _f in (fs, hk):
+    _s = open(_f, encoding="utf-8", errors="surrogateescape").read()
+    if "fake_state" in _s:
+        _sys.stderr.write("::error::%s 仍有 fake_state 残留\n" % _f)
+        _sys.exit(1)
+PYEOF
+  # 仅作信息输出；5.15 主补丁不含 perm_error（权限顺序重排只适配 my_write_context 形态），
+  # 这里 grep 可能无命中，必须 || true，否则 set -e 会中断整个补丁步骤。
+  grep -n 'backup_sepolicy' security/selinux/selinuxfs.c | head -3 || true
+  grep -n 'perm_error' security/selinux/hooks.c | head -3 || true
+fi
+
+# ==================== 移植 KernelSU 的 SELinux 隐藏侧信道修复（旧 fake_state 形态）====================
+# 仅当 SUSFS 主补丁为旧形态（定义 my_write_context/my_write_access/my_setprocattr）时适用。
+# 检测方把 /sys/fs/selinux/{context,access} 与 setprocattr 当 oracle：比对
+# 假策略(fake_state)与全局 selinux_state 的 SID、以及权限检查顺序，来识别隐藏。
+# SUSFS 主补丁实现的 my_write_context / my_write_access / my_setprocattr 缺这两点，
+# 这里按 KernelSU 的做法补齐：
+#   - sidtab 同步（KernelSU #3873）：用假策略解析后再同步进全局 sidtab，消除 SID 差异；
+#   - 权限检查顺序（KernelSU df03912f）：仅当 backup 解析失败时才做 SETCURRENT 检查。
+# 现行主补丁（2026-10 起）已不定义这三个函数：<6.6 的门控内联形态与 NEW_MODEL 分支的
+# 8 参 _with_policy 转换（sidtab 同步内置）已覆盖同等的侧信道修复，见下方 else 分支说明。
+if [ "${NEW_MODEL:-0}" != 1 ] && [ -f security/selinux/selinuxfs.c ] && grep -q 'static ssize_t my_write_context' security/selinux/selinuxfs.c \
+  && [ -f security/selinux/hooks.c ] && grep -q 'static int my_setprocattr' security/selinux/hooks.c; then
+  python3 - <<'PYEOF'
+import re
+
+def sed(path, name, pat, repl):
+    src = open(path, encoding="utf-8", errors="surrogateescape").read()
+    new, n = re.subn(pat, repl, src, count=1)
+    if n == 0:
+        print("::warning::%s: %s not matched (skip)" % (path, name))
+        return
+    open(path, "w", encoding="utf-8", errors="surrogateescape").write(new)
+    print("%s: %s OK" % (path, name))
+
+fs = "security/selinux/selinuxfs.c"
+# my_write_context（<6.6 用 fake_state；>=6.6 用 backup_sepolicy 的 _with_policy 解析）
+sed(fs, "ctx(<6.6)", r"(\tlength = security_context_to_sid\(&fake_state, buf, size, &sid, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(&selinux_state, buf, size, &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "ctx(>=6.6)", r"(\tlength = security_context_to_sid_with_policy\(backup_sepolicy, buf, size, &sid, SECSID_NULL, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(buf, size, &tmp_sid, GFP_KERNEL);\n\t}\n")
+# my_write_access scon / tcon
+sed(fs, "scon(<6.6)", r"(\tlength = security_context_str_to_sid\(&fake_state, scon, &ssid, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_str_to_sid(&selinux_state, scon, &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "scon(>=6.6)", r"(\tlength = security_context_to_sid_with_policy\(backup_sepolicy, scon, strlen\(scon\), &ssid, SECSID_NULL, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(scon, strlen(scon), &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "tcon(<6.6)", r"(\tlength = security_context_str_to_sid\(&fake_state, tcon, &tsid, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_str_to_sid(&selinux_state, tcon, &tmp_sid, GFP_KERNEL);\n\t}\n")
+sed(fs, "tcon(>=6.6)", r"(\tlength = security_context_to_sid_with_policy\(backup_sepolicy, tcon, strlen\(tcon\), &tsid, SECSID_NULL, GFP_KERNEL\);\n\tif \(length\)\n\t\tgoto out;\n)",
+    "\\1\t{\n\t\tu32 tmp_sid;\n\t\t/* FINASU_SIDTAB_SYNC */\n\t\tsecurity_context_to_sid(tcon, strlen(tcon), &tmp_sid, GFP_KERNEL);\n\t}\n")
+
+hk = "security/selinux/hooks.c"
+# 去掉无条件 SETCURRENT 检查（<6.6 带 &selinux_state；>=6.6 不带）
+sed(hk, "rm_early(<6.6)", r"\terror = avc_has_perm\(&selinux_state,\n\t\t\t\t     mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL\);\n\n\tif \(error\)\n\t\treturn error;\n\n", "")
+sed(hk, "rm_early(>=6.6)", r"\terror = avc_has_perm\(mysid, mysid, SECCLASS_PROCESS,\n\t\t\t\t     PROCESS__SETCURRENT, NULL\);\n\n\tif \(error\)\n\t\treturn error;\n\n", "")
+# 仅在 backup 解析失败时才检查 SETCURRENT，并同步全局 sidtab
+sed(hk, "seq+sync(<6.6)", r"(\t\terror = security_context_to_sid\(&fake_state, value, size,\n\t\t\t\t\t\t&sid, GFP_KERNEL\);\n)\t\tif \(error\)\n\t\t\treturn error;\n",
+    "\\1\t\tif (error) {\n\t\t\t/* FINASU_SEQ: 仅当 backup 解析失败时才做 SETCURRENT 检查（KernelSU df03912f） */\n\t\t\tint perm_error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n\t\t{\n\t\t\tu32 tmp_sid;\n\t\t\t/* FINASU_SIDTAB_SYNC (KernelSU #3873) */\n\t\t\tsecurity_context_to_sid(&selinux_state, value, size, &tmp_sid, GFP_KERNEL);\n\t\t}\n")
+sed(hk, "seq+sync(>=6.6)", r"(\t\terror = security_context_to_sid_with_policy\(backup_sepolicy, str, size, &sid, SECSID_NULL, GFP_KERNEL\);\n)\t\tif \(error\)\n\t\t\treturn error;\n",
+    "\\1\t\tif (error) {\n\t\t\t/* FINASU_SEQ: 仅当 backup 解析失败时才做 SETCURRENT 检查（KernelSU df03912f） */\n\t\t\tint perm_error = avc_has_perm(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);\n\t\t\treturn perm_error ?: error;\n\t\t}\n\t\t{\n\t\t\tu32 tmp_sid;\n\t\t\t/* FINASU_SIDTAB_SYNC (KernelSU #3873) */\n\t\t\tsecurity_context_to_sid(str, size, &tmp_sid, GFP_KERNEL);\n\t\t}\n")
+PYEOF
+  # 仅作信息输出；旧形态模式部分失配时 grep 无命中，必须 || true，否则 pipefail 会中断整个补丁步骤
+  grep -n 'FINASU_SIDTAB_SYNC' security/selinux/selinuxfs.c | head || true
+  grep -n 'FINASU_SIDTAB_SYNC\|FINASU_SEQ' security/selinux/hooks.c | head || true
+else
+  # 主补丁形态判定：
+  #   旧形态定义 my_write_context/my_write_access/my_setprocattr，缺失即异常，保留告警；
+  #   现行形态（2026-10 起的主补丁）不再定义这三个函数：<6.6 内联改 selinux_setprocattr /
+  #   selinuxfs 调用点（should_check_current+fake_error 门控），>=6.6 用 backup_sepolicy +
+  #   my_security_context_to_sid（内核侧自含）。侧信道修复（sidtab 同步 #3873、权限顺序
+  #   df03912f）由 NEW_MODEL 分支的 8 参 _with_policy 转换与门控校验覆盖，无需旧形态移植。
+  if grep -qE 'static ssize_t my_write_(context|access)' security/selinux/selinuxfs.c 2>/dev/null \
+    || grep -q 'static int my_setprocattr' security/selinux/hooks.c 2>/dev/null; then
+    echo "::warning::未找到 SUSFS 的 my_write_context/my_setprocattr，跳过 SELinux 侧信道移植"
+  else
+    echo "SUSFS 主补丁为现行形态（无 my_write_context/my_setprocattr）：侧信道修复由门控校验与 8 参 _with_policy 内置同步覆盖，无需旧形态移植"
+  fi
+fi
+
+# ==================== SUSFS 路径隐藏回退（跨命名空间 / FUSE） ====================
+# susfs_add_sus_path（非 loop）在“调用方命名空间”里 kern_path 解析路径；管理器/ksud 常解析不到
+# /storage/emulated 这类 FUSE 路径（-ENOENT），于是规则加不进去、路径隐藏失效。
+# 这里加回退：解析失败时自动改走 LOOP 机制（内核 workqueue 在 init 命名空间稍后解析并打标记）。
+if [ -f fs/susfs.c ] && grep -qF 'void susfs_add_sus_path(void __user **user_info)' fs/susfs.c \
+  && ! grep -qF 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c; then
+  python3 - <<'PYEOF'
+p = "fs/susfs.c"
+s = open(p, encoding="utf-8", errors="surrogateescape").read()
+old1 = "void susfs_add_sus_path(void __user **user_info) {"
+new1 = "void susfs_add_sus_path_loop(void __user **user_info);\n" + old1
+if s.count(old1) != 1:
+    print("::warning::fs/susfs.c: susfs_add_sus_path 签名不是预期形态，跳过")
+else:
+    s = s.replace(old1, new1, 1)
+    old2 = ("\tif (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {\n"
+            "\t\tinfo.err = -EFAULT;\n"
+            "\t\tgoto out_copy_to_user;\n"
+            "\t}\n\n"
+            "\tinfo.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);\n"
+            "\tif (info.err) {\n"
+            "\t\tSUSFS_LOGE(\"failed opening file '%s'\\n\", info.target_pathname);\n"
+            "\t\tgoto out_copy_to_user;\n"
+            "\t}\n")
+    new2 = ("\tif (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {\n"
+            "\t\tinfo.err = -EFAULT;\n"
+            "\t\tgoto out_copy_to_user;\n"
+            "\t}\n\n"
+            "\tinfo.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);\n"
+            "\tif (info.err) {\n"
+            "\t\tSUSFS_LOGE(\"failed opening '%s' in current ns, fallback to sus_path_loop\\n\", info.target_pathname);\n"
+            "\t\t/* FINASU_SUS_PATH_LOOP_FALLBACK: 调用方命名空间解析不到（常见于 /storage/emulated 等 FUSE 路径）时，\n"
+            "\t\t   退回 LOOP 机制，交由内核 workqueue 在 init 命名空间稍后解析并重新打标记 */\n"
+            "\t\tsusfs_add_sus_path_loop(user_info);\n"
+            "\t\treturn;\n"
+            "\t}\n")
+    if s.count(old2) != 1:
+        print("::warning::fs/susfs.c: susfs_add_sus_path 代码形态不是预期，跳过回退")
+    else:
+        open(p, "w", encoding="utf-8", errors="surrogateescape").write(s.replace(old2, new2, 1))
+        print("fs/susfs.c: 已加 SUSFS 路径隐藏 LOOP 回退")
+PYEOF
+  grep -n 'FINASU_SUS_PATH_LOOP_FALLBACK' fs/susfs.c | head
+else
+  echo "::warning::未找到 fs/susfs.c 的 susfs_add_sus_path，跳过路径隐藏回退"
+fi
+
+
+# ---- 预期冲突处理：上游已包含同款修改的 .rej 剔除，真实缺失的手工补齐 ----
+
+# 1) fs/unicode：ASB 内核已包含上游 "unicode: don't special case ignorable code
+#    points" 提交，主补丁删除 ignore_init / 重生成 utf8data 的 hunk 已天然满足
+if [[ -f fs/unicode/mkutf8data.c.rej ]] && ! grep -q 'ignore_init' fs/unicode/mkutf8data.c; then
+  echo "fs/unicode .rej 为上游已包含同款修改，剔除预期冲突文件"
+  rm -f fs/unicode/*.rej
+fi
+
+# 2) mm/rmap.c：6.6.127+ 已包含 huge_pmd_unshare 的 tlb 化改造
+if [[ -f mm/rmap.c.rej ]] && grep -q 'tlb_gather_mmu_vma' mm/rmap.c; then
+  echo "mm/rmap.c .rej 为上游已包含同款修改，剔除预期冲突文件"
+  rm -f mm/rmap.c.rej
+fi
+
+# 3) fs/proc/task_mmu.c（6.12.69+）：show_smap 重构（vma_pages → vma_data_pages）
+#    导致 SUS_MAP 检查 hunk 上下文失配被拒，属于真实缺失，手工补回
+if [[ -f fs/proc/task_mmu.c.rej ]] \
+  && grep -qF 'static int show_smap(struct seq_file *m, void *v)' fs/proc/task_mmu.c; then
+  SHOW_SMAP_BODY="$(sed -n '/^static int show_smap(struct seq_file \*m, void \*v)/,/^}/p' fs/proc/task_mmu.c)"
+  if [[ -n "$SHOW_SMAP_BODY" ]] && ! grep -qF 'SUSFS_IS_INODE_SUS_MAP' <<< "$SHOW_SMAP_BODY"; then
+    echo "为 show_smap 手工补入 SUS_MAP 检查（6.12.69+ 上下文漂移）"
+    perl -0pi -e 's/(static int show_smap\(struct seq_file \*m, void \*v\)\n\{\n\tstruct vm_area_struct \*vma = v;\n\tstruct mem_size_stats mss = \{\};\n)/$1\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\tif (vma->vm_file) {\n\t\tif (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n\t\t\treturn 0;\n\t}\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n/' fs/proc/task_mmu.c
+    if ! grep -qF 'SUSFS_IS_INODE_SUS_MAP' fs/proc/task_mmu.c; then
+      echo "::error::show_smap SUS_MAP 检查手工补丁失败，请人工核对 fs/proc/task_mmu.c"
+      exit 1
+    fi
+  fi
+
+  # 同一个文件在 6.12.69+ 还把 show_smaps_rollup 重写成 VMA_ITERATOR + for_each_vma
+  # （删掉了 out_unlock 分支），主补丁那两段 hunk 依赖旧上下文全部被拒；虽然不影响
+  # 编译，但 SUS_MAP 标记的 VMA 会经 /proc/<pid>/smaps_rollup 泄露。这里在 do 循环
+  # 入口整段跳过该 VMA，并同步 last_vma_end，语义与主补丁的 bypass_orig_flow 一致。
+  if grep -qF 'bypass_orig_flow' fs/proc/task_mmu.c.rej \
+    && ! sed -n '/^static int show_smaps_rollup(struct seq_file \*m, void \*v)/,/^}/p' fs/proc/task_mmu.c \
+      | grep -qF 'SUSFS_IS_INODE_SUS_MAP'; then
+    echo "为 show_smaps_rollup 手工补入 SUS_MAP 跳过逻辑（6.12.69+ 上下文漂移）"
+    python3 - <<'PYEOF'
+p = "fs/proc/task_mmu.c"
+s = open(p, encoding="utf-8", errors="surrogateescape").read()
+start = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
+end = s.find("\n}\n", start)
+if start < 0 or end < 0:
+    print("::error::fs/proc/task_mmu.c: 未找到 show_smaps_rollup")
+    raise SystemExit(1)
+body = s[start:end]
+needle = "\tdo {\n\t\tsmap_gather_stats(vma, &mss, 0);\n"
+insert = (
+    "\tdo {\n"
+    "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+    "\t\t/* SUS_MAP 标记的 VMA 整体跳过，避免 rollup 中泄露 */\n"
+    "\t\tif (vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))) {\n"
+    "\t\t\tlast_vma_end = vma->vm_end;\n"
+    "\t\t\tcontinue;\n"
+    "\t\t}\n"
+    "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+    "\t\tsmap_gather_stats(vma, &mss, 0);\n"
+)
+if "SUSFS_IS_INODE_SUS_MAP" in body:
+    print("show_smaps_rollup 已含 SUS_MAP 检查，跳过")
+elif body.count(needle) != 1:
+    print("::error::show_smaps_rollup 循环入口形态不是预期，跳过")
+    raise SystemExit(1)
+else:
+    s = s[:start] + body.replace(needle, insert, 1) + s[end:]
+    open(p, "w", encoding="utf-8", errors="surrogateescape").write(s)
+    print("show_smaps_rollup: 已补入 SUS_MAP 跳过逻辑")
+PYEOF
+    if ! sed -n '/^static int show_smaps_rollup(struct seq_file \*m, void \*v)/,/^}/p' fs/proc/task_mmu.c \
+      | grep -qF 'SUSFS_IS_INODE_SUS_MAP'; then
+      echo "::error::show_smaps_rollup SUS_MAP 跳过逻辑手工补丁失败，请人工核对 fs/proc/task_mmu.c"
+      exit 1
+    fi
+  fi
+
+  # 拒绝内容已全部补齐，删除 .rej，避免继续污染 Rejects 产物
+  TASK_MMU_UNRESOLVED=0
+  if grep -qF 'bypass_orig_flow' fs/proc/task_mmu.c.rej \
+    && ! sed -n '/^static int show_smaps_rollup(struct seq_file \*m, void \*v)/,/^}/p' fs/proc/task_mmu.c \
+      | grep -qF 'SUSFS_IS_INODE_SUS_MAP'; then
+    TASK_MMU_UNRESOLVED=1
+  fi
+  if grep -qF 'static int show_smap(struct seq_file *m, void *v)' fs/proc/task_mmu.c.rej \
+    && ! sed -n '/^static int show_smap(struct seq_file \*m, void \*v)/,/^}/p' fs/proc/task_mmu.c \
+      | grep -qF 'SUSFS_IS_INODE_SUS_MAP'; then
+    TASK_MMU_UNRESOLVED=1
+  fi
+  if [[ "$TASK_MMU_UNRESOLVED" -eq 0 ]]; then
+    # 仅当拒绝内容全部落在已处理的两个函数上时才删除，避免掩盖新出现的漂移
+    UNKNOWN_HUNK="$(grep '^@@' fs/proc/task_mmu.c.rej | grep -vE 'show_smap|show_smaps_rollup' || true)"
+    if [[ -z "$UNKNOWN_HUNK" ]]; then
+      echo "fs/proc/task_mmu.c 拒绝内容已全部补齐，剔除 .rej"
+      rm -f fs/proc/task_mmu.c.rej
+    else
+      echo "::warning title=task_mmu 冲突::仍有未识别的 hunk，保留 .rej 供排查："
+      echo "$UNKNOWN_HUNK"
+    fi
+  fi
+fi
 
 # 为尚未提供 SU 会话 FD 接口的 SukiSU/BakaSU 恢复旧版 exec hook 行为
 EXEC_HELPER=""
-if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "BakaSU" ]]; then
+if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "BakaSU" || "$KSU_VARIANT" == "FinaSU" ]]; then
   if grep -qF 'ksu_install_su_fd();' fs/exec.c; then
     EXEC_HELPER="ksu_install_su_fd"
   elif grep -qF 'ksu_handle_post_execveat_sucompat(' fs/exec.c; then
@@ -169,24 +655,35 @@ if [[ -n "$EXEC_HELPER" ]] \
   fi
 fi
 
-# 上游 5.10 补丁把 susfs_sus_kstat_spoof_vfs_statfs 的 extern 声明放在了
-# susfs_statfs_by_dentry 之后，clang -Werror 会报隐式声明；声明晚于使用时前移
-if [[ -f fs/statfs.c ]] && grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c; then
-  STATFS_USE=$(grep -n 'if (!susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c | head -1 | cut -d: -f1)
-  STATFS_DECL=$(grep -n '^extern int susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c | head -1 | cut -d: -f1)
-  if [[ -n "$STATFS_USE" && -n "$STATFS_DECL" && "$STATFS_DECL" -gt "$STATFS_USE" ]] \
-    && grep -q '^static int susfs_statfs_by_dentry(' fs/statfs.c; then
-    echo "前移 statfs.c 中 susfs_sus_kstat_spoof_vfs_statfs 的声明"
-    sed -i '/^static int susfs_statfs_by_dentry(/i extern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);' fs/statfs.c
-  fi
+# 上游 5.10 主补丁把 susfs_sus_kstat_spoof_vfs_statfs 的 extern 声明放在了
+# fs/statfs.c 的使用点之后（vfs_statfs 之前），clang -Werror 报隐式声明；
+# 声明属于 SUSFS 接口，直接补进公共头 include/linux/susfs_def.h：
+# 不依赖 statfs.c 内锚点与行号比较，声明重复合法，上游后续自行修复也不冲突。
+# 注意：FinaSU 的 setuid_hook.c / sucompat.c 会在仅有 <linux/types.h> 等基础
+# 头文件时就包含 susfs_def.h，此时 struct kstatfs 尚未声明，原型内引入新
+# struct 标签会触发 clang -Werror,-Wvisibility（上游内核构建日志实证），
+# 因此必须连同 struct 前置声明一起插入。
+SUSFS_DEF_H="$KERNEL_ROOT/common/include/linux/susfs_def.h"
+if [[ -f fs/statfs.c ]] && grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c \
+  && [[ -f "$SUSFS_DEF_H" ]] \
+  && ! grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' "$SUSFS_DEF_H"; then
+  echo "将 susfs_sus_kstat_spoof_vfs_statfs 声明补入 include/linux/susfs_def.h"
+  sed -i '/^#endif \/\/ #ifndef KSU_SUSFS_DEF_H$/i struct inode;\nstruct kstatfs;\nextern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);' "$SUSFS_DEF_H"
 fi
 
-# 在编译前报告 SUSFS 主补丁产生的冲突文件，上游自带的 .rej 不计入
-mapfile -t SUSFS_REJ_FILES < <(list_untracked_rej)
-SUSFS_REJ_COUNT=${#SUSFS_REJ_FILES[@]}
+# 上游 susfs.c 直接调用 security_sb_statfs 却没有包含 linux/security.h，
+# 5.15+ 靠其他头文件间接带入，5.10 没有这条路径，clang -Werror 报隐式声明；缺失时补上
+if [[ -f fs/susfs.c ]] && grep -qF 'security_sb_statfs(' fs/susfs.c \
+  && ! grep -qF '#include <linux/security.h>' fs/susfs.c; then
+  echo "为 susfs.c 补充 linux/security.h 头文件"
+  sed -i '0,/^#include <linux\/fs.h>$/s//#include <linux\/fs.h>\n#include <linux\/security.h>/' fs/susfs.c
+fi
+
+# 在编译前报告 SUSFS 主补丁产生的冲突文件
+SUSFS_REJ_COUNT=$(find . -name '*.rej' | wc -l)
 if [ "$SUSFS_REJ_COUNT" -gt 0 ]; then
   echo "::warning title=SUSFS 补丁冲突::SUSFS 主补丁产生了 ${SUSFS_REJ_COUNT} 个 .rej 冲突文件，可能导致后续编译失败（详见 Rejects 产物）"
-  printf '%s\n' "${SUSFS_REJ_FILES[@]}"
+  find . -name '*.rej' -print
 fi
 
 # 还原仅用于补丁匹配的临时源码调整
@@ -243,13 +740,6 @@ if [[ "$ANDROID_VERSION" == "android15" && "$KERNEL_VERSION" == "6.6" ]]; then
   if [[ "$CURRENT_SUB" -le 57 ]]; then
     echo "还原 Android 15 6.6 memory.c 临时调整"
     sed -i '/^#include <linux\/zswap.h>$/d' mm/memory.c
-  fi
-fi
-
-if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
-  if [[ "$CURRENT_SUB" -ge 58 ]] && ! grep -qF '#include <linux/dma-buf.h>' fs/exec.c; then
-    echo "还原 Android 16 6.12 exec.c 临时调整"
-    sed -i '0,/^#include /s//#include <linux\/dma-buf.h>\n&/' fs/exec.c
   fi
 fi
 
@@ -325,3 +815,14 @@ if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
     echo "已修复 setuid_hook.c 重复定义问题"
   fi
 fi
+
+# 守护：主补丁若再次因上下文漂移漏掉 susfs_def.h，在这里给出可读错误，
+# 而不是等到编译 fs/proc/task_mmu.c 时才报一串 SUSFS_IS_INODE_* 隐式声明
+for SUSFS_SRC in fs/proc/task_mmu.c fs/namespace.c; do
+  [[ -f "$SUSFS_SRC" ]] || continue
+  if grep -qE 'SUSFS_IS_INODE_|CL_COPY_MNT_NS' "$SUSFS_SRC" \
+    && ! grep -qF '#include <linux/susfs_def.h>' "$SUSFS_SRC"; then
+    echo "::error::$SUSFS_SRC 使用了 SUSFS 宏但缺少 linux/susfs_def.h，主补丁 hunk 未应用"
+    exit 1
+  fi
+done
