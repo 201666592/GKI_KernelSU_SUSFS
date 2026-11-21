@@ -51,4 +51,4 @@ gki-android16-6.12=
 #   1) 仍属于 builtin 分支
 #   2) kernel/include/uapi/supercall.h 仍存在（否则 UAPI 修补会跳过、可能与管理器错配）
 #   3) kernel/feature/selinux_hide.c 的写法仍与修补正则匹配（看构建日志是否输出“已消除外部符号引用”）
-sukisu=1ba8414eab9797e61696560699b1f63850d3861a
+sukisu=7a7b2d609c394b73d5a0b2a876559f667ba0a3e01ba8414eab9797e61696560699b1f63850d3861a
